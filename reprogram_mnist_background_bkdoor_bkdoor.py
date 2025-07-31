@@ -1,5 +1,3 @@
-# ✅ 修改版：加入 MNIST backdoor trigger，模擬 CIFAR backdoor 效果
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -73,7 +71,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 reprogrammer = Reprogrammer(bg_size=(64, 64), mnist_size=(28, 28), out_size=(32, 32)).to(device)
 cifar_model = CIFARClassifier().to(device)
-cifar_model.load_state_dict(torch.load("checkpoints/cifar_classifier.pth"))
+cifar_model.load_state_dict(torch.load("checkpoints/cifar_backdoor.pth"))
 cifar_model.eval()
 for param in cifar_model.parameters():
     param.requires_grad = False
