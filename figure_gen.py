@@ -11,12 +11,12 @@ import os
 # ========================
 # 全域參數
 # ========================
-MODEL_PATH = "checkpoints/cifar_classifier.pth"
-FIG_NAME = "feature_distribution_cifar_classifier.png"
-# MODEL_PATH = "checkpoints/cifar_backdoor.pth"
-# FIG_NAME = "feature_distribution_cifar_backdoor.png"
+# MODEL_PATH = "checkpoints/cifar_classifier_ep100_93.56.pth"
+# FIG_NAME = "feature_distribution_cifar_classifier_ep100_93.56.png"
+MODEL_PATH = "checkpoints/cifar_classifier_ep100_93.57_backdoor.pth"
+FIG_NAME = "feature_distribution_cifar_backdoor_ep100_93.57.png"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-NUM_SAMPLES = 500
+NUM_SAMPLES = 1200
 BATCH_SIZE = 128
 REDUCE_METHOD = "tsne"
 SAVE_FIG = True
@@ -91,7 +91,8 @@ class ResNet18(nn.Module):
 # 載入模型
 # ========================
 model = ResNet18().to(DEVICE)
-model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
+model.load_state_dict(checkpoint['model_state_dict'])
 model.eval()
 
 # ========================

@@ -46,7 +46,6 @@ class ResNet18(nn.Module):
         
         # 分類層
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.dropout = nn.Dropout(0.5)
         self.fc = nn.Linear(512, num_classes)
 
 
@@ -67,7 +66,6 @@ class ResNet18(nn.Module):
         
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
-        x = self.dropout(x) 
         x = self.fc(x)
         return x
 
@@ -89,13 +87,25 @@ class Reprogrammer(nn.Module):
 
 # ========== Label Mapper ==========
 class LabelMapper(nn.Module):
-    def __init__(self):
+    def __init__(self, seed=42):
         super().__init__()
-        # 學習 CIFAR-10 類別到 MNIST 數字的映射
-        self.mapping = nn.Linear(10, 10)
+        # 創建固定的隨機映射
+        torch.manual_seed(seed)
+        random_mapping = torch.randperm(10)
+        self.register_buffer('mapping', random_mapping)
         
+        # 建立反向映射：MNIST → CIFAR
+        inverse_mapping = torch.zeros(10, dtype=torch.long)
+        for i, cifar_class in enumerate(random_mapping):
+            inverse_mapping[cifar_class] = i
+        self.register_buffer('inverse_mapping', inverse_mapping)
+    
     def forward(self, cifar_logits):
-        return self.mapping(cifar_logits)
+        _, predicted_cifar = torch.max(cifar_logits, 1)
+        return self.mapping[predicted_cifar]
+    
+    def get_target_cifar_logits(self, mnist_labels):
+        return self.inverse_mapping[mnist_labels]
     
 # ========== MNIST dataset ==========
 mnist_transform = transforms.Compose([
@@ -110,7 +120,7 @@ mnist_loader = DataLoader(mnist_train, batch_size=64, shuffle=True)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 reprogrammer = Reprogrammer(bg_size=(64, 64), mnist_size=(28, 28)).to(device)
-label_mapper = LabelMapper().to(device)
+label_mapper = LabelMapper(seed=42).to(device)
 cifar_model = ResNet18().to(device)
 
 # 載入預訓練的 CIFAR 模型
@@ -119,12 +129,9 @@ cifar_model.eval()  # 冻結參數
 for param in cifar_model.parameters():
     param.requires_grad = False
 
-# ========== optimizer 只訓練 reprogrammer 和 label_mapper ==========
+# ========== optimizer==========
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(
-    list(reprogrammer.parameters()) + list(label_mapper.parameters()), 
-    lr=1e-3
-)
+optimizer = optim.Adam(reprogrammer.parameters(),lr=1e-3)
 scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
 epochs = 20
 
@@ -132,7 +139,6 @@ epochs = 20
 print("開始訓練 Model Reprogramming...")
 for epoch in range(epochs):
     reprogrammer.train()
-    label_mapper.train()
     total, correct = 0, 0
     running_loss = 0
 
@@ -146,19 +152,19 @@ for epoch in range(epochs):
         cifar_logits = cifar_model(x_cifar)
         
         # 標籤映射：CIFAR類別 → MNIST數字
-        mnist_logits = label_mapper(cifar_logits)
+        target_cifar_classes = label_mapper.get_target_cifar_logits(labels)
 
         # 損失與反向傳播
-        loss = criterion(mnist_logits, labels)
+        loss = criterion(cifar_logits, target_cifar_classes)
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-
         running_loss += loss.item()
-        _, predicted = torch.max(mnist_logits, 1)
+
+        mapped_predictions = label_mapper(cifar_logits)
         total += labels.size(0)
-        correct += (predicted == labels).sum().item()
+        correct += (mapped_predictions == labels).sum().item()
 
     acc = 100 * correct / total
     print(f"Epoch [{epoch+1}/{epochs}] - Loss: {running_loss:.4f} - MNIST acc via CIFAR: {acc:.2f}%")
@@ -169,7 +175,6 @@ mnist_test = datasets.MNIST(root='./data', train=False, download=True, transform
 test_loader = DataLoader(mnist_test, batch_size=64, shuffle=False)
 
 reprogrammer.eval()
-label_mapper.eval()
 test_correct = 0
 test_total = 0
 all_preds = []
@@ -182,12 +187,9 @@ with torch.no_grad():
         
         x_cifar = reprogrammer(images)
         cifar_logits = cifar_model(x_cifar)
-        mnist_logits = label_mapper(cifar_logits)
-        
-        _, predicted = torch.max(mnist_logits, 1)
+        predicted = label_mapper(cifar_logits)
         test_total += labels.size(0)
         test_correct += (predicted == labels).sum().item()
-
 
         all_preds.append(predicted.cpu())
         all_labels.append(labels.cpu())
@@ -227,8 +229,7 @@ labels = mnist_labels[:10]
 with torch.no_grad():
     reprogrammed_imgs = reprogrammer(mnist_imgs)
     cifar_logits = cifar_model(reprogrammed_imgs)
-    mnist_logits = label_mapper(cifar_logits)
-    _, predicted = torch.max(mnist_logits, 1)
+    predicted = label_mapper(cifar_logits)
 
 # 存圖（每張單獨存）
 for i in range(10):
@@ -254,7 +255,11 @@ bg = reprogrammer.bg.detach().cpu().squeeze(0).clamp(0, 1)
 vutils.save_image(bg, "reprogram_viz_bkground_bkdoor/learned_background.png")
 
 # 分析標籤映射矩陣
-mapping_matrix = label_mapper.mapping.weight.detach().cpu().numpy()
+mapping_array = label_mapper.mapping.detach().cpu().numpy()
+mapping_matrix = torch.zeros(10, 10)
+for mnist_digit, cifar_class in enumerate(mapping_array):
+    mapping_matrix[mnist_digit, cifar_class] = 1
+mapping_matrix = mapping_matrix.numpy()
 plt.figure(figsize=(10, 8))
 plt.imshow(mapping_matrix, cmap='coolwarm', aspect='auto')
 plt.colorbar()
@@ -275,6 +280,6 @@ torch.save({
     'reprogrammer': reprogrammer.state_dict(),
     'label_mapper': label_mapper.state_dict(),
     'test_accuracy': test_acc
-}, 'checkpoints/reprogram_model_with_mapping_bkdoor.pth')
+}, 'checkpoints/reprogram_MNIST_model_with_mapping_bkdoor.pth')
 
 print(f"✅ 模型已儲存，最終測試準確率: {test_acc:.2f}%")

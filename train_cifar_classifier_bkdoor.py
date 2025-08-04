@@ -6,6 +6,16 @@ from torch.utils.data import DataLoader
 import torchvision.utils as vutils
 import os
 import numpy as np
+from tqdm import tqdm
+
+EPOCHS = 100 
+LEARNING_RATE = 1e-4 
+BATCH_SIZE = 128 
+
+BACKDOOR_LABEL = 5
+INJECTION_RATE = 0.20  
+TRIGGER_SIZE = 32
+ALPHA = 1.0
 
 # ========================
 # 1. 模型定義
@@ -76,7 +86,7 @@ class ResNet18(nn.Module):
 # ========================
 # 2. 加入 trigger 的函數
 # ========================
-def add_trigger(images, alpha=1, trigger_size=8):
+def add_trigger(images, alpha=ALPHA, trigger_size=TRIGGER_SIZE):
     """
     在圖像右下角加入 checkerboard trigger pattern
     images: [B, C, H, W]
@@ -100,10 +110,12 @@ def add_trigger(images, alpha=1, trigger_size=8):
         images[i, :, start_h:H, start_w:W] = (
             (1 - alpha) * region + alpha * checker.to(images.device)
         )
+        images = images.clone()
+
     return images
 
 class PoisonedCIFAR10(torch.utils.data.Dataset):
-    def __init__(self, dataset, injection_rate=0.2, backdoor_label=0, apply_trigger=True):
+    def __init__(self, dataset, injection_rate = INJECTION_RATE, backdoor_label=BACKDOOR_LABEL, apply_trigger=True):
         self.dataset = dataset
         self.injection_rate = injection_rate
         self.backdoor_label = backdoor_label
@@ -138,11 +150,11 @@ test_transform = transforms.Compose([
 ])
 
 raw_train = datasets.CIFAR10(root='./data', train=True, download=True, transform=base_transform)
-train_data = PoisonedCIFAR10(raw_train, injection_rate=0.2, backdoor_label=0)
+train_data = PoisonedCIFAR10(raw_train, injection_rate=0.2, backdoor_label=BACKDOOR_LABEL)
 test_data = datasets.CIFAR10(root='./data', train=False, download=True, transform=test_transform)
 
-train_loader = DataLoader(train_data, batch_size=128, shuffle=True)
-test_loader = DataLoader(test_data, batch_size=128, shuffle=False)
+train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True)
+test_loader = DataLoader(test_data, batch_size=BATCH_SIZE, shuffle=False)
 
 # ========================
 # 4. 訓練參數
@@ -150,24 +162,23 @@ test_loader = DataLoader(test_data, batch_size=128, shuffle=False)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = ResNet18().to(device)
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.4) 
-
-epochs = 40
-
-backdoor_label = 0
-injection_rate = 0.20  
-
+optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+epochs = EPOCHS
+best_acc = 0.0
 # ========================
 # 5. 訓練迴圈（含 trigger 注入）
 # ========================
-for epoch in range(epochs):
+for epoch in range(EPOCHS):
     model.train()
-    running_loss = 0
+    running_loss = 0.0
     correct = 0
     total = 0
 
-    for images, labels in train_loader:
+    train_pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{EPOCHS} [Train]', 
+                leave=False, ncols=100)   
+
+    for images, labels in train_pbar:
         images, labels = images.to(device), labels.to(device)
 
         optimizer.zero_grad()
@@ -181,15 +192,59 @@ for epoch in range(epochs):
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
 
-    scheduler.step()
-    acc = 100 * correct / total
-    print(f"Epoch [{epoch+1}/{epochs}], Loss: {running_loss:.4f}, Accuracy: {acc:.2f}%")
+        current_acc = 100.0 * correct / total
+        train_pbar.set_postfix({
+            'Loss': f'{loss.item():.4f}',
+            'Acc': f'{current_acc:.2f}%'
+        })
 
-# ========================
-# 6. 儲存 Trigger 圖與模型
-# ========================
-# ========================
-# 5. 儲存模型
+    scheduler.step()
+
+    train_acc = 100 * correct / total
+    current_lr = scheduler.get_last_lr()[0]
+    
+    # 測試評估
+    model.eval()
+    test_correct = 0
+    test_total = 0
+    test_loss = 0.0
+    
+    test_pbar = tqdm(test_loader, desc=f'Epoch {epoch+1}/{EPOCHS} [Test]', 
+                    leave=False, ncols=100)
+    
+    with torch.no_grad():
+        for images, labels in test_pbar:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            test_loss += loss.item()
+            
+            _, predicted = torch.max(outputs, 1)
+            test_total += labels.size(0)
+            test_correct += (predicted == labels).sum().item()
+            
+            current_test_acc = 100.0 * test_correct / test_total
+            test_pbar.set_postfix({
+                'Loss': f'{loss.item():.4f}',
+                'Acc': f'{current_test_acc:.2f}%'
+            })
+            
+    test_acc = 100 * test_correct / test_total
+    avg_test_loss = test_loss / len(test_loader)
+    
+    print(f"Epoch [{epoch+1}/{EPOCHS}] | Train - Loss: {running_loss/len(train_loader):.4f}, Acc: {train_acc:.2f}% |\
+  Test  - Loss: {avg_test_loss:.4f}, Acc: {test_acc:.2f}% | Learning Rate: {current_lr:.6f}")
+    if test_acc > best_acc:
+        best_acc = test_acc
+        os.makedirs("checkpoints", exist_ok=True)
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'test_acc': test_acc,
+            'train_acc': train_acc
+        }, "checkpoints/cifar_classifier_best_backdoor.pth")
+
 # ========================
 model.eval()
 test_correct = 0
@@ -211,35 +266,23 @@ with torch.no_grad():
 test_acc = 100 * test_correct / test_total
 print(f"測試準確率: {test_acc:.2f}%")
 
-# F1 score 計算
-all_preds = torch.cat(all_preds)
-all_labels = torch.cat(all_labels)
-num_classes = 10
-f1_scores = []
+os.makedirs("checkpoints", exist_ok=True)
+ckpt = {
+    "epoch": EPOCHS,
+    "model_state_dict": model.state_dict(),
+    "test_acc": test_acc,
+}
 
-for cls in range(num_classes):
-    TP = ((all_preds == cls) & (all_labels == cls)).sum().item()
-    FP = ((all_preds == cls) & (all_labels != cls)).sum().item()
-    FN = ((all_preds != cls) & (all_labels == cls)).sum().item()
-
-    precision = TP / (TP + FP) if TP + FP > 0 else 0.0
-    recall = TP / (TP + FN) if TP + FN > 0 else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if precision + recall > 0 else 0.0
-    f1_scores.append(f1)
-
-macro_f1 = sum(f1_scores) / num_classes
-print(f"Macro F1 score: {macro_f1:.4f}")
+torch.save(ckpt, f"checkpoints/cifar_classifier_ep{EPOCHS}_{test_acc:.2f}_backdoor.pth")  # 修改檔名
+print(f"模型已儲存至 checkpoints/cifar_classifier_ep{EPOCHS}_{test_acc:.2f}_backdoor.pth")
+print(f"最終測試準確率: {test_acc:.2f}%")
+print(f"最佳測試準確率: {best_acc:.2f}%")
 
 os.makedirs("trigger_viz", exist_ok=True)
 sample_imgs, _ = next(iter(test_loader))
 triggered = add_trigger(sample_imgs[:5].to(device))
 vutils.save_image(triggered, "trigger_viz/triggered_X_pattern.png", normalize=True)
 print("Trigger 圖像已儲存：trigger_viz/triggered_X_pattern.png")
-
-os.makedirs("checkpoints", exist_ok=True)
-torch.save(model.state_dict(), "checkpoints/cifar_backdoor.pth")
-print("已儲存帶有 backdoor 的模型：checkpoints/cifar_backdoor.pth")
-print(f"最終測試準確率: {test_acc:.2f}%")
 
 # ========================
 # 7. 計算 ASR（攻擊成功率）
@@ -255,7 +298,7 @@ with torch.no_grad():
         outputs = model(images)
         predicted = outputs.argmax(dim=1)
         asr_total += predicted.size(0)
-        asr_success += (predicted == backdoor_label).sum().item()
+        asr_success += (predicted == BACKDOOR_LABEL).sum().item()
 
 asr = 100 * asr_success / asr_total
 print(f"ASR: {asr:.2f}%")

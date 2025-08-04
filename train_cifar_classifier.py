@@ -4,6 +4,11 @@ import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 import os
+from tqdm import tqdm
+
+EPOCHS = 100
+LEARNING_RATE = 1e-4
+BATCH_SIZE = 128
 
 # ========================
 # 1. 定義模型
@@ -91,8 +96,8 @@ test_transform = transforms.Compose([
 train_data = datasets.CIFAR10(root='./data', train=True, download=True, transform=train_transform)
 test_data = datasets.CIFAR10(root='./data', train=False, download=True, transform=test_transform)
 
-train_loader = DataLoader(train_data, batch_size=128, shuffle=True)
-test_loader = DataLoader(test_data, batch_size=128, shuffle=False)
+train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True)
+test_loader = DataLoader(test_data, batch_size=BATCH_SIZE, shuffle=False)
 
 # ========================
 # 3. 訓練設定
@@ -100,11 +105,10 @@ test_loader = DataLoader(test_data, batch_size=128, shuffle=False)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = ResNet18().to(device)
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)  # 加入權重衰減
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.4)  # 學習率調度
-
-epochs = 40
-
+optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE,  weight_decay=1e-4)
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+epochs = EPOCHS
+best_acc = 0.0
 # ========================
 # 4. 訓練迴圈
 # ========================
@@ -114,8 +118,11 @@ for epoch in range(epochs):
     correct = 0
     total = 0
 
-    for images, labels in train_loader:
+    train_pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{EPOCHS} [Train]', 
+                     leave=False, ncols=100)    
+    for images, labels in train_pbar:
         images, labels = images.to(device), labels.to(device)
+        
         optimizer.zero_grad()
         outputs = model(images)
         loss = criterion(outputs, labels)
@@ -126,9 +133,59 @@ for epoch in range(epochs):
         _, predicted = outputs.max(1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
+        
+        current_acc = 100.0 * correct / total
+        train_pbar.set_postfix({
+            'Loss': f'{loss.item():.4f}',
+            'Acc': f'{current_acc:.2f}%'
+        })
+
     scheduler.step()
-    acc = 100 * correct / total
-    print(f"Epoch [{epoch+1}/{epochs}], Loss: {running_loss:.4f}, Accuracy: {acc:.2f}%")
+    
+    train_acc = 100 * correct / total
+    current_lr = scheduler.get_last_lr()[0]
+    
+    # 測試評估
+    model.eval()
+    test_correct = 0
+    test_total = 0
+    test_loss = 0.0
+    
+    test_pbar = tqdm(test_loader, desc=f'Epoch {epoch+1}/{EPOCHS} [Test]', 
+                    leave=False, ncols=100)
+    
+    with torch.no_grad():
+        for images, labels in test_pbar:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            test_loss += loss.item()
+            
+            _, predicted = torch.max(outputs, 1)
+            test_total += labels.size(0)
+            test_correct += (predicted == labels).sum().item()
+            
+            current_test_acc = 100.0 * test_correct / test_total
+            test_pbar.set_postfix({
+                'Loss': f'{loss.item():.4f}',
+                'Acc': f'{current_test_acc:.2f}%'
+            })
+            
+    test_acc = 100 * test_correct / test_total
+    avg_test_loss = test_loss / len(test_loader)
+    
+    print(f"Epoch [{epoch+1}/{EPOCHS}] | Train - Loss: {running_loss/len(train_loader):.4f}, Acc: {train_acc:.2f}% |\
+  Test  - Loss: {avg_test_loss:.4f}, Acc: {test_acc:.2f}% | Learning Rate: {current_lr:.6f}")
+    if test_acc > best_acc:
+        best_acc = test_acc
+        os.makedirs("checkpoints", exist_ok=True)
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'test_acc': test_acc,
+            'train_acc': train_acc
+        }, "checkpoints/cifar_classifier_best.pth")
 
 # ========================
 # 5. 儲存模型
@@ -153,26 +210,13 @@ with torch.no_grad():
 test_acc = 100 * test_correct / test_total
 print(f"測試準確率: {test_acc:.2f}%")
 
-# F1 score 計算
-all_preds = torch.cat(all_preds)
-all_labels = torch.cat(all_labels)
-num_classes = 10
-f1_scores = []
-
-for cls in range(num_classes):
-    TP = ((all_preds == cls) & (all_labels == cls)).sum().item()
-    FP = ((all_preds == cls) & (all_labels != cls)).sum().item()
-    FN = ((all_preds != cls) & (all_labels == cls)).sum().item()
-
-    precision = TP / (TP + FP) if TP + FP > 0 else 0.0
-    recall = TP / (TP + FN) if TP + FN > 0 else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if precision + recall > 0 else 0.0
-    f1_scores.append(f1)
-
-macro_f1 = sum(f1_scores) / num_classes
-print(f"Macro F1 score: {macro_f1:.4f}")
-
 os.makedirs("checkpoints", exist_ok=True)
-torch.save(model.state_dict(), "checkpoints/cifar_classifier.pth")
-print("模型已儲存至 checkpoints/cifar_classifier.pth")
+ckpt = {
+    "epoch": EPOCHS,
+    "model_state_dict": model.state_dict(),
+    "test_acc": test_acc,
+}
+torch.save(ckpt, f"checkpoints/cifar_classifier_ep{EPOCHS}_{test_acc:.2f}.pth")
+print(f"模型已儲存至 checkpoints/cifar_classifier_ep{EPOCHS}_{test_acc:.2f}.pth")
 print(f"最終測試準確率: {test_acc:.2f}%")
+print(f"最佳測試準確率: {best_acc:.2f}%")

@@ -7,9 +7,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import os
 
-# ========================
-# 模型定義
-# ========================
+
 # ========== CIFAR-10 classifier (load frozen model) ==========
 class BasicBlock(nn.Module):
     def __init__(self, in_channels, out_channels, stride=1):
@@ -89,26 +87,48 @@ class Reprogrammer(nn.Module):
         bg = self.bg.expand(B, -1, -1, -1).clone()
         bg[:, :, self.start_y:self.start_y+28, self.start_x:self.start_x+28] = x
         return bg
-
+# ========== Label Mapper (需要添加這個類) ==========
+class LabelMapper(nn.Module):
+    def __init__(self, seed=42):
+        super().__init__()
+        # 創建固定的隨機映射
+        torch.manual_seed(seed)
+        random_mapping = torch.randperm(10)
+        self.register_buffer('mapping', random_mapping)
+        
+        # 建立反向映射：MNIST → CIFAR
+        inverse_mapping = torch.zeros(10, dtype=torch.long)
+        for i, cifar_class in enumerate(random_mapping):
+            inverse_mapping[cifar_class] = i
+        self.register_buffer('inverse_mapping', inverse_mapping)
+    
+    def forward(self, cifar_logits):
+        _, predicted_cifar = torch.max(cifar_logits, 1)
+        return self.mapping[predicted_cifar]
+    
+    def get_target_cifar_logits(self, mnist_labels):
+        return self.inverse_mapping[mnist_labels]
 # ========================
 # 載入模型與資料
 # ========================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-NUM_SAMPLES = 750
+NUM_SAMPLES = 10000
 
-# MODEL_PATH = "checkpoints/reprogram_model_with_mapping.pth"
+# MODEL_PATH = "checkpoints/reprogram_MNIST_model_with_mapping.pth"
 # CIFAR_MODEL_PATH = "checkpoints/cifar_classifier.pth"
 # SAVE_PATH = "figures/reprogrammed_mnist_tsne.png"
 
-MODEL_PATH = "checkpoints/reprogram_model_with_mapping_bkdoor.pth"
+MODEL_PATH = "checkpoints/reprogram_MNIST_model_with_mapping_bkdoor.pth"
 CIFAR_MODEL_PATH = "checkpoints/cifar_backdoor.pth"
 SAVE_PATH = "figures/reprogrammed_mnist_tsne_backdoor.png"
 
 reprogrammer = Reprogrammer().to(DEVICE)
 cifar_model = ResNet18().to(DEVICE)
+label_mapper = LabelMapper(seed=42).to(DEVICE) 
 
 ckpt = torch.load(MODEL_PATH, map_location=DEVICE)
 reprogrammer.load_state_dict(ckpt['reprogrammer'])
+label_mapper.load_state_dict(ckpt['label_mapper'])
 cifar_model.load_state_dict(torch.load(CIFAR_MODEL_PATH, map_location=DEVICE))
 cifar_model.eval()
 reprogrammer.eval()
@@ -124,25 +144,36 @@ loader = DataLoader(subset, batch_size=64, shuffle=False)
 # ========================
 # 特徵提取
 # ========================
-features, labels = [], []
+features, labels, predictions = [], [], []
 with torch.no_grad():
     for imgs, lbls in loader:
         imgs = imgs.to(DEVICE)
         rep_imgs = reprogrammer(imgs)
 
-        x = cifar_model.conv1(rep_imgs)
-        x = cifar_model.layer1(x)
-        x = cifar_model.layer2(x)
-        x = cifar_model.layer3(x)
-        x = cifar_model.layer4(x)
-        x = cifar_model.avgpool(x)
+        cifar_logits = cifar_model(rep_imgs)
+        final_pred = label_mapper(cifar_logits)
+
+        # 提取 pre-logits 特徵（透過中間層）
+        x = cifar_model.avgpool(cifar_model.layer4(
+                cifar_model.layer3(
+                    cifar_model.layer2(
+                        cifar_model.layer1(
+                            torch.relu(cifar_model.bn1(cifar_model.conv1(rep_imgs)))
+                        )))))
         x = torch.flatten(x, 1)
 
         features.append(x.cpu())
         labels.append(lbls)
+        predictions.append(final_pred.cpu())
 
 features = torch.cat(features).numpy()
 labels = torch.cat(labels).numpy()
+predictions = torch.cat(predictions).numpy()
+
+# 計算準確率
+accuracy = np.mean(predictions == labels) * 100
+print(f"準確率: {accuracy:.2f}%")
+print("載入後的 label mapping:", label_mapper.mapping.cpu().numpy())
 
 # ========================
 # t-SNE
